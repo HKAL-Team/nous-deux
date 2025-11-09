@@ -1,0 +1,21 @@
+# Dépendances
+node_modules
+/public
+
+# Build Next.js
+.next/
+out/
+
+# Fichiers logs
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+pnpm-debug.log*
+
+# Fichiers environnement
+.env
+.env.local
+
+# Fichiers Git
+.git
+.gitignore

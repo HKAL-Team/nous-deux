@@ -5,8 +5,17 @@ import { Server } from 'socket.io';
 import { createClient } from 'redis';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { PrismaClient } from '@prisma/client';
-const prisma = new PrismaClient();
-import { v4 as uuidv4 } from 'uuid';
+const prisma = new PrismaClient(); // Keep it global, but calls must be guarded in Next.js components
+
+const SKIP_REDIS_CONNECTION = process.env.SKIP_REDIS_CONNECTION === 'true';
+const redisHost = process.env.REDIS_HOST || '127.0.0.1';
+const redisPort = process.env.REDIS_PORT || 6379;
+
+let pubClient, subClient;
+if (!SKIP_REDIS_CONNECTION) {
+  pubClient = createClient({ url: `redis://${redisHost}:${redisPort}` });
+  subClient = pubClient.duplicate();
+}
 
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
@@ -14,14 +23,20 @@ const handle = app.getRequestHandler();
 const cleanupTimers = new Map();
 
 app.prepare().then(async () => {
-  const redisClientServer = createClient({
-    url: process.env.REDIS_URL || 'redis://localhost:6379',
-  });
+  let redisClientServer;
 
-  redisClientServer.on('error', (err) =>
-    console.error('Redis Client Error', err)
-  );
-  await redisClientServer.connect();
+  if (!SKIP_REDIS_CONNECTION) {
+    redisClientServer = createClient({
+      url: process.env.REDIS_URL || `redis://${redisHost}:${redisPort}`,
+    });
+
+    redisClientServer.on('error', (err) =>
+      console.error('Redis Client Error', err)
+    );
+    await redisClientServer.connect();
+  } else {
+    console.warn('⚠️ SKIP_REDIS_CONNECTION est actif. Les services de jeu seront désactivés pour le build.');
+  }
 
   const server = createServer((req, res) => {
     const urlStr = req.url ?? '/';
@@ -35,14 +50,17 @@ app.prepare().then(async () => {
     },
   });
 
-  const pubClient = redisClientServer.duplicate();
-  const subClient = redisClientServer.duplicate();
-  await Promise.all([pubClient.connect(), subClient.connect()]);
-
-  io.adapter(createAdapter(pubClient, subClient));
+  if (!SKIP_REDIS_CONNECTION) {
+    const pubClientIO = redisClientServer.duplicate();
+    const subClientIO = redisClientServer.duplicate();
+    await Promise.all([pubClientIO.connect(), subClientIO.connect()]);
+    io.adapter(createAdapter(pubClientIO, subClientIO));
+  }
 
   io.on('connection', async (socket) => {
     console.log('🟢 Connected:', socket.id);
+
+    const isGameServiceReady = !SKIP_REDIS_CONNECTION && redisClientServer;
 
     const updateOnlinePlayers = async () => {
       const sockets = await io.fetchSockets();
@@ -51,10 +69,13 @@ app.prepare().then(async () => {
 
     await updateOnlinePlayers();
 
-    socket.on('create-room', async ({}) => {}); // Not implemented yet
+    socket.on('create-room', async ({ }) => { }); // Not implemented yet
 
     /** Handle local events **/
     socket.on('local:join-room', async ({ roomId, player1, player2 }) => {
+      if (!isGameServiceReady) {
+        return socket.emit('local:error_join-room', 'Service de jeu indisponible (build ou maintenance)');
+      }
       if (!roomId || !player1?.username || !player2?.username) {
         return socket.emit(
           'local:error_join-room',
@@ -128,14 +149,16 @@ app.prepare().then(async () => {
     });
 
     socket.on('local:start-game', async ({ mode, roomId }) => {
+      if (!isGameServiceReady) {
+        return socket.emit('local:error_start-game', 'Service de jeu indisponible (build ou maintenance)');
+      }
       if (!mode || !roomId) {
         return socket.emit('local:error_start-game', 'Mode ou roomId manquant');
       }
 
       try {
         const sessionKey = `session:${roomId}`;
-        const rawSession = await redisClientServer.get(sessionKey);
-
+        const rawSession = await redisClientServer.get(sessionKey); 
         if (!rawSession) {
           return socket.emit('local:error_start-game', 'Session introuvable');
         }
@@ -144,11 +167,13 @@ app.prepare().then(async () => {
         const usedQuestions = session.usedQuestions || [];
 
         let allQuestions = await prisma.question.findMany({
-          where: {
-            mode,
-            id: { notIn: usedQuestions },
-          },
-        });
+                    where: {
+                        mode,
+                        id: { notIn: usedQuestions },
+                    },
+                });
+
+        // ... (reste de la logique de jeu)
 
         function getRandomItems(arr, n) {
           return arr.sort(() => Math.random() - 0.5).slice(0, n);
@@ -226,18 +251,21 @@ app.prepare().then(async () => {
     });
 
     socket.on('local:answer', async ({ gameId, accepted }) => {
+      if (!isGameServiceReady) {
+        return socket.emit('local:error', 'Service de jeu indisponible (build ou maintenance)');
+      }
       if (!gameId || typeof accepted !== 'boolean') {
         return socket.emit('local:error', 'Paramètres invalides');
       }
 
       const gameKey = `game:${gameId}`;
-      const rawGame = await redisClientServer.get(gameKey);
+      const rawGame = await redisClientServer.get(gameKey); 
       if (!rawGame) return socket.emit('local:error', 'Partie introuvable');
 
       const game = JSON.parse(rawGame);
 
       const sessionKey = `session:${game.roomId}`;
-      const rawSession = await redisClientServer.get(sessionKey);
+      const rawSession = await redisClientServer.get(sessionKey); 
       if (!rawSession) return socket.emit('local:error', 'Session introuvable');
       const session = JSON.parse(rawSession);
 
@@ -279,10 +307,13 @@ app.prepare().then(async () => {
     });
 
     socket.on('local:player-leave', async ({ roomId }) => {
+      if (!isGameServiceReady) {
+        return console.warn('Tentative de déconnexion pendant le build ignorée.');
+      }
       console.log('local:player-leave', roomId, socket.id);
       const roomSockets = io.sockets.adapter.rooms.get(roomId);
       const sessionKey = `session:${roomId}`;
-      const rawSession = await redisClientServer.get(sessionKey);
+      const rawSession = await redisClientServer.get(sessionKey); 
       if (!rawSession) return socket.emit('local:error', 'Session introuvable');
       const session = JSON.parse(rawSession);
 
@@ -297,8 +328,10 @@ app.prepare().then(async () => {
       }
     });
 
-    /** Handle online events **/
     socket.on('online:join-room', async ({ roomId, player }) => {
+      if (!isGameServiceReady) {
+        return socket.emit('online:error_join-room', 'Service de jeu indisponible (build ou maintenance)');
+      }
       if (!roomId || !player?.username) {
         return socket.emit(
           'online:error_join-room',
@@ -310,7 +343,7 @@ app.prepare().then(async () => {
 
       try {
         const sessionKey = `session:${roomId}`;
-        const rawSession = await redisClientServer.get(sessionKey);
+        const rawSession = await redisClientServer.get(sessionKey); 
 
         if (!rawSession) {
           socket.emit('online:error_join-room', 'Session introuvable');
